@@ -9,7 +9,8 @@ import { syncHandler } from '../api/sync.js';
 const PASSWORD = 'correct horse';
 async function call(handler, { method = 'GET', url = '/', body, headers = {}, ip = '1.2.3.4' } = {}) {
   const req = { method, url, body, headers: { 'x-forwarded-for': ip, ...headers } }, res = { headers: {}, statusCode: 200, setHeader(k, v) { this.headers[k.toLowerCase()] = v; } };
-  await new Promise(resolve => { res.end = text => { res.text = text; resolve(); }; handler(req, res); });
+  res.end = text => { res.text = text; };
+  await handler(req, res);
   return { status: res.statusCode, body: res.text ? JSON.parse(res.text) : null, headers: res.headers };
 }
 function server(store = memoryStore(), password = PASSWORD) {
@@ -78,53 +79,51 @@ test('bad requests are refused with the reason', async () => {
   assert.match((await bad([{ collection: 'library', id: 'x', updated: 1 }])).body.error, /items\[0\]/);
   assert.equal((await call(s.sync, { headers: auth, url: '/api/sync?since=-1' })).status, 400);
   const huge = await bad([anime('big', 1, { blob: 'x'.repeat(70 * 1024) })]);
-  assert.deepEqual(huge.body, { rev: 0, accepted: 0, current: [] }, 'an item over 64 KB is left out');
+  assert.equal(huge.status, 400, 'oversized items fail visibly instead of being silently lost');
+  assert.equal((await bad([anime('ok', 1), anime('big', 1, { blob: 'x'.repeat(70 * 1024) })])).status, 400);
+  assert.equal((await call(s.sync, { headers: auth })).body.items.length, 0, 'a rejected batch writes nothing');
 });
 
-// A stand-in for Upstash's REST pipeline: the Redis commands the store sends, run on maps.
-function fakeUpstash() {
-  const strings = new Map(), hashes = new Map(), zsets = new Map(), calls = [];
-  const hash = key => { if (!hashes.has(key)) hashes.set(key, new Map()); return hashes.get(key); };
-  const zset = key => { if (!zsets.has(key)) zsets.set(key, new Map()); return zsets.get(key); };
-  const run = ([name, key, ...args]) => {
-    switch (name) {
-      case 'HMGET': return args.map(field => hash(key).get(field) ?? null);
-      case 'HSET': for (let i = 0; i < args.length; i += 2) hash(key).set(args[i], String(args[i + 1])); return args.length / 2;
-      case 'INCRBY': { const value = Number(strings.get(key) || 0) + Number(args[0]); strings.set(key, String(value)); return value; }
-      case 'INCR': return run(['INCRBY', key, 1]);
-      case 'GET': return strings.get(key) ?? null;
-      case 'EXPIRE': return 1;
-      case 'DEL': strings.delete(key); return 1;
-      case 'ZADD': for (let i = 0; i < args.length; i += 2) zset(key).set(args[i + 1], Number(args[i])); return args.length / 2;
-      case 'ZRANGEBYSCORE': {
-        const [min, max, withScores, limitWord, offset, count] = args;
-        assert.equal(withScores, 'WITHSCORES'); assert.equal(limitWord, 'LIMIT'); assert.equal(max, '+inf'); assert.match(min, /^\(\d+$/);
-        const rows = [...zset(key)].filter(([, score]) => score > Number(min.slice(1))).sort((a, b) => a[1] - b[1]).slice(Number(offset), Number(offset) + Number(count));
-        return rows.flatMap(([member, score]) => [member, String(score)]);
-      }
-      default: throw new Error(`unexpected command ${name}`);
-    }
-  };
-  const fetchImpl = async (url, options) => {
-    calls.push({ url, auth: options.headers.Authorization });
-    const commands = JSON.parse(options.body);
-    return { ok: true, json: async () => commands.map(command => ({ result: run(command) })) };
-  };
-  return { fetchImpl, calls };
-}
 
-test('the Upstash store speaks Redis through the REST pipeline, with either pair of Vercel variables', async () => {
-  assert.equal(redisStore({}), null);
-  const upstash = fakeUpstash();
-  const store = redisStore({ KV_REST_API_URL: 'https://example.upstash.io/', KV_REST_API_TOKEN: 'tok' }, upstash.fetchImpl);
-  const s = server(store);
-  await call(s.sync, { method: 'POST', headers: auth, body: { items: [anime('a', 100), anime('b', 100)] } });
-  await call(s.sync, { method: 'POST', headers: auth, body: { items: [anime('a', 300, { title: 'new' }), anime('b', 50)] } });
-  const all = (await call(s.sync, { headers: auth, url: '/api/sync?since=0' })).body;
-  assert.deepEqual(all.items.map(item => [item.id, item.data.title, item.rev]), [['b', '작품 b', 2], ['a', 'new', 3]]);
-  assert.equal(all.rev, 3);
-  assert.ok(upstash.calls.every(call => call.url === 'https://example.upstash.io/pipeline' && call.auth === 'Bearer tok'));
-  for (let i = 0; i <= LOCK_AFTER; i++) await call(s.login, { method: 'POST', body: { password: 'nope' } });
-  assert.equal((await call(s.login, { method: 'POST', body: { password: 'nope' } })).status, 429);
-  assert.ok(redisStore({ UPSTASH_REDIS_REST_URL: 'https://x.upstash.io', UPSTASH_REDIS_REST_TOKEN: 't' }));
+test('equal timestamps with different content return the authoritative copy', async () => {
+  const s = server();
+  await call(s.sync, { method: 'POST', headers: auth, body: { items: [anime('a', 100)] } });
+  const result = await call(s.sync, { method: 'POST', headers: auth, body: { items: [anime('a', 100, { title: 'different' })] } });
+  assert.equal(result.body.accepted, 0);
+  assert.equal(result.body.current[0].data.title, '작품 a');
+});
+
+test('a write after the read snapshot remains available at the next cursor', async () => {
+  const { push, pull } = await import('../lib/sync.js');
+  const store = memoryStore();
+  await push(store, [anime('a', 100)]);
+  const racing = { ...store, async changes(since, limit) {
+    const snapshot = await store.changes(since, limit);
+    await push(store, [anime('b', 200)]);
+    return snapshot;
+  } };
+  const first = await pull(racing, 0);
+  assert.equal(first.rev, 1);
+  assert.deepEqual((await pull(store, first.rev)).items.map(x => x.id), ['b']);
+});
+
+test('malformed types, unsafe cursors, UTF-8 buffers and body limits', async () => {
+  const s = server();
+  for (const item of [anime('a', 1.5), { ...anime('a', 1), data: [] }, { ...anime('a', 1), deleted: 'false' }]) {
+    assert.equal((await call(s.sync, { method: 'POST', headers: auth, body: { items: [item] } })).status, 400);
+  }
+  assert.equal((await call(s.sync, { headers: auth, url: '/api/sync?since=9007199254740992' })).status, 400);
+  assert.equal((await call(s.login, { method: 'POST', body: Buffer.from(JSON.stringify({ password: PASSWORD })) })).status, 200);
+  assert.equal((await call(s.login, { method: 'POST', body: ' '.repeat(4 * 1024 * 1024 + 1) })).status, 413);
+  const preflight = await call(s.sync, { method: 'OPTIONS' });
+  assert.equal(preflight.status, 204); assert.equal(preflight.body, null);
+});
+
+test('store outages stay JSON with CORS, without exposing credentials', async () => {
+  const s = server({ async changes() { throw new Error('private token'); }, async hit() { throw new Error('private token'); } });
+  const response = await call(s.sync, { headers: auth });
+  assert.equal(response.status, 503);
+  assert.equal(response.headers['access-control-allow-origin'], '*');
+  assert.doesNotMatch(response.body.error, /private token/);
+  assert.equal((await call(s.login, { method: 'POST', body: { password: 'wrong' } })).status, 503);
 });

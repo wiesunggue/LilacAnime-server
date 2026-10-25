@@ -58,7 +58,7 @@ Vercel 무료 플랜과 Upstash 무료 한도로 충분합니다.
 
 ### `POST /api/sync` (토큰 필요)
 
-이 기기에서 바뀐 항목을 보냅니다. 한 번에 500개까지.
+이 기기에서 바뀐 항목을 보냅니다. 한 번에 500개까지, JSON 요청 본문은 4MB까지 지원합니다.
 
 ```json
 { "items": [
@@ -82,7 +82,7 @@ Vercel 무료 플랜과 Upstash 무료 한도로 충분합니다.
 
 ### `GET /api/sync?since=<rev>` (토큰 필요)
 
-리비전 `since` 다음에 바뀐 항목을 오래된 변경부터 500개씩 줍니다. 처음에는 `since=0`.
+리비전 `since` 다음에 바뀐 항목을 오래된 변경부터 최대 500개씩 줍니다. 큰 항목은 응답 크기를 제한하기 위해 더 작은 페이지로 나눕니다. 처음에는 `since=0`.
 
 ```json
 { "items": [ { "collection": "library", "id": "...", "updated": 1791620000000, "data": { }, "rev": 41 } ], "more": false, "rev": 42 }
@@ -116,6 +116,13 @@ LILAC_PASSWORD=비밀번호123 node dev.js
 ```
 
 `dev.js`는 같은 API를 `http://localhost:3000`에 띄웁니다. Upstash 환경 변수가 없으면 데이터를 메모리에 둡니다(종료하면 사라짐). 데스크톱 앱의 기기 동기화에 `http://127.0.0.1:3000`을 넣어 시험할 수 있습니다.
+
+실제 Redis의 Lua 스크립트까지 검증하려면 `redis-server`를 설치하고 `npm test`를 실행하세요.
+실행 파일 위치가 다르면 `REDIS_SERVER=/경로/redis-server npm test`로 지정합니다.
+Redis가 없으면 통합 테스트 2개는 건너뜁니다.
+
+쓰기 비교·리비전 부여·저장, 읽기 페이지·리비전 조회는 각각 하나의 Lua 스크립트에서 원자적으로 처리합니다.
+기존 `lilac:v1:*` 데이터와 PC/휴대폰 API 형식을 유지하므로 별도 데이터 이관은 필요하지 않습니다.
 
 외부 패키지 없이 Node.js 20 이상의 `fetch`로 Upstash REST API를 부릅니다.
 
