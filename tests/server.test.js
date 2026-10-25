@@ -127,3 +127,21 @@ test('store outages stay JSON with CORS, without exposing credentials', async ()
   assert.doesNotMatch(response.body.error, /private token/);
   assert.equal((await call(s.login, { method: 'POST', body: { password: 'wrong' } })).status, 503);
 });
+
+test('readiness checks the database connection rather than only environment variable presence', async () => {
+  const response = await call(statusHandler({ password: PASSWORD, store: { async ping() { throw new Error('bad token'); } } }));
+  assert.equal(response.status, 200); assert.equal(response.body.ready, false);
+  assert.match(response.body.problems[0], /Upstash Redis/);
+  assert.doesNotMatch(response.body.problems[0], /bad token/);
+});
+
+test('large records use byte-bounded pages without skipping the remainder', async () => {
+  const { push, pull } = await import('../lib/sync.js');
+  const store = memoryStore();
+  await push(store, Array.from({ length: 60 }, (_, i) => anime(String(i), i + 1, { text: 'x'.repeat(60 * 1024) })));
+  const first = await pull(store, 0);
+  assert.equal(first.more, true); assert.ok(first.items.length < 60);
+  assert.ok(Buffer.byteLength(JSON.stringify(first)) < 4 * 1024 * 1024);
+  const second = await pull(store, first.rev);
+  assert.equal(second.more, false); assert.equal(first.items.length + second.items.length, 60);
+});
